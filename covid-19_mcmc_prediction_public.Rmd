@@ -1,0 +1,658 @@
+---
+title: "MCMC Coronavirus Model"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(fig.path='figures/covid-',echo = F) #saving figs if you knit
+```
+
+This Rmarkdown document performings a MCMC parameter estimation procedure in a simple SEIR model using death data which I've mostly cut n pasted from the worldometer web pages but it would be simple enough to use other sources. Set the "case" variable and it should run for a variety of countries though the output plots may need tweaking for suitable start and end dates.
+
+```{r model, include=F,echo=F}
+
+
+# Represent the basic dynamics in a 6-box version of SEIR based on this post from Thomas House:
+# https://personalpages.manchester.ac.uk/staff/thomas.house/blog/modelling-herd-immunity.html
+#There are two E and I boxes, the reasons for which I
+#can guess at but it's not my model so I won't :-)
+
+odefun <-function(t,state,parameters){
+  with(as.list(c(state, parameters)),{
+  beta <- parameters[1]
+  sigma <- parameters[2]
+  gamma <- parameters[3]
+
+  x<- state
+  
+    dx <- rep(0,6)
+    dx[1] <- -beta*x[1]*(x[4] + x[5]) #susceptible
+    dx[2] <- beta*x[1]*(x[4] + x[5]) - sigma*x[2] #newly infected but latent
+    dx[3] <- sigma*x[2] - sigma*x[3] #late stage latent
+    dx[4] <- sigma*x[3] - gamma*x[4] #newly infectious
+    dx[5] <- gamma*x[4] - gamma*x[5] #late infectious
+    dx[6] <- gamma*x[5] #recovered
+    return(list(dx))
+})}
+```
+
+Set a few parameters
+
+```{r params, include=F,echo=F}
+# Some basic setup that I need 
+
+library(date)
+
+epi <- data.frame(row.names = c("UK","UK_no_intervention","Lombardy","Italy","Spain","Switzerland","France","Portugal","Sweden","Wuhan"),startdate =  as.Date(c("2020-2-1","2020-2-1","2020-1-1","2020-1-1","2020-2-1","2020-2-1","2020-2-1","2020-2-20","2020-2-1","2019-11-20")),interventiondate=as.Date(c("2020-3-22","2020-6-1","2020-3-8","2020-3-8","2020-3-13","2020-3-17","2020-3-17","2020-3-19","2020-3-17","2020-1-23")),N=c(6.7e7,6.7e7,6.e7,1.e7,4.7e7,8.6e6,6.7e7,1.e7,1.e7,6.e7))
+
+#SET CASE
+
+case <- "UK"
+#case <- "UK_no_intervention" #counterfactual where I set interventiondate very late
+#case <- "Lombardy"
+#case <- "Spain"
+#case <- "Italy"
+#case <- "Switzerland"
+#case <- "Sweden"
+#case <- "France"
+#case <- "Portugal"
+
+startdate <- epi[case,1]
+interventiondate <- epi[case,2]
+N <- epi[case,3]
+
+
+print(case)
+print(c(startdate,interventiondate))
+print(N)
+
+
+```
+
+Centile function:
+
+```{r centile}
+centile <- function(data,cent){
+  
+  len <- dim(data)[2] #length of series
+  num <- dim(data)[1]
+out <- rep(0,len)
+for (i in 1:len){
+  so <- sort(data[,i])
+  out[i] <- so[max(1,num*cent)] #max operator to stop falling out of range, this just takes the floor which is sloppy but fine for my purposes. Improve it if you care!
+ 
+}  
+
+
+return(out)
+
+}
+
+```
+
+
+```{r death}
+#function to calculate deaths from a vector of infectious
+
+dead <- function(infectious,death,infectious_period){
+ 
+    deadout  <- 0*infectious #empty array of correct size
+
+#parameters deduced from Ferguson except changing their mean of 18.8 to 15 for somewhat subjective reasons. If you want to replicate their function just change the 15 back to 18.8
+
+  sh=4.9
+  sc=15/sh
+
+death_gam <- dgamma((0:60),scale=sc,shape=sh)
+death_gam <- death_gam/sum(death_gam)
+death_rev<- rev(death_gam)
+
+for (j in 1:length(deadout)){
+  
+  deadout[j] <- (death/infectious_period)*sum(death_rev[max(1,62-j):61]*infectious[max(1,j-60):j])
+}
+ 
+return(deadout)  
+}
+
+
+
+```
+
+
+This code is how I run the model in chunks with different R0 values sequentially
+
+```{r piecewise_runner, echo=F}
+
+library(deSolve)
+
+runner <- function(rundeck,latent_p,infectious_p,i0_p){
+
+allout <- array(0,dim=c(1+tail(rundeck[,1],1),7))
+
+for (tt in 1:dim(rundeck)[1]){
+
+    if (tt>1) {
+      start <- rundeck$dy[tt-1] 
+      state <- tail(out,n=1)[2:7]
+    }
+  else{
+    start = 0
+    state=array(c(1.0-2.0*i0_p, 0.0, 0.0, i0_p, i0_p, 0.0))
+  }
+  
+
+    finish <- rundeck$dy[tt]
+    beta <- rundeck$R0[tt] / infectious_p
+    sigma <- 2.0 / latent_p
+    gamma <- 2.0 / infectious_p
+
+parameters <- c(beta,sigma,gamma)
+
+if(finish > start){ #only run if it's a positive interval
+out <- ode(y=state,times=seq(start,finish),func = odefun, parms = parameters,method="ode45") 
+#not sure about integration method.....default was fine unless R0 went too small..don't think precision is really an issue here
+
+
+allout[start:finish+1,] <- out
+
+}
+
+
+}
+
+return(allout)
+}
+```
+
+code to run model and evaluate cost (log likelihood) vs observations. Including prior.
+
+```{r modelcost, echo=F}
+
+modelcost <- function(params,obs){ 
+
+  latent_period <- max(.5,min(params[1],10)) #bound with 0.1 and 10
+  infectious_period <- max(.5,min(params[2],10)) #bound with 0.1 and 10
+  i0 <- max(0.,min(exp(params[3]),.01)) #bound with 0. and 0.01 NB this one is logarithmic!
+  death <- max(0.001,min(params[4],0.05)) #bound with 0.1 and 5%
+
+    R0 <- max(1.,min(params[5],10)) #bound with 0.1 and 10 also not less than 1 in initial segment
+    Rt <- max(0.1,min(params[6],10)) #bound with 0.1 and 10
+
+#prior mean for parameters in order
+    par_pri <- c(4.,2,-15,0.0075,3,1.)
+
+#prior sd
+    par_sd <- c(.5,0.1,15,0.0003,2,.5)
+  
+#set up the rundeck
+    
+  #total length of run is hard-wired here, doesn't need to be too long until we get a lot of obs
+  
+    rundeck <- data.frame(dy = c(as.numeric(as.Date(interventiondate)-as.Date(startdate)),120),R0 = c(R0,Rt))
+
+    #run the model
+    
+  outs <- runner(rundeck,latent_period,infectious_period,i0)
+
+
+  infectout  <- rowSums(outs[,5:6]) #calculated total infected over time
+  
+deadout <- dead(infectout,death,infectious_period) #daily deaths
+
+
+    cumdeadout = cumsum(deadout) #convenient to have cumulative deaths
+
+    
+    #Cost function = log likelihood  
+
+    #need to make sure that zero/low deaths doesn't give a huge error in log space, so I've imposed lower bounds on both model and data
+    #note even thoguh I have modified data to eliminate missed days there can still some occasional zeros in the early stages of the epidemic
+          
+      data_cost <- -0.5*sum(((log((pmax(N*deadout[obs[,1]],0.1)))-log(pmax(obs[,2],.1)))^2)/obs[,3]^2)
+      pri_cost <- -0.5*sum((params-par_pri)^2/par_sd^2)
+      
+      cost <- data_cost + pri_cost
+
+      return(cost)
+}
+
+
+```
+
+
+```{r get_data}
+
+#input the data and a touch of pre-processing depending on the case
+
+#start point for MCMC calculation also set here...can be anything so long as it's not too bad. Prior mean is usually a sensible choice.
+
+theta_start <- c(4,2,-15,0.007,3,1.1)
+
+
+if(case == "Lombardy") {
+  
+library(jsonlite)
+
+  
+  ##https://github.com/pcm-dpc/COVID-19/blob/master/dati-json/dpc-covid19-ita-regioni.json
+italy <- fromJSON("data/dpc-covid19-ita-regioni.json")
+#or use web for latest version?
+
+lombardy_date <- as.Date(italy$data[which(italy$denominazione_regione == "Lombardia")])
+
+lombardy_dead <- italy$deceduti[which(italy$denominazione_regione == "Lombardia")]
+
+daynumber <- as.numeric(as.Date(lombardy_date)-as.Date(startdate))
+dailydead <- c(lombardy_dead[1],lombardy_dead[-1]-head(lombardy_dead,-1))
+
+####HAVE TO EDIT IN EXTRA EARLY DATA FOUND ON WIKIPEDIA
+#https://en.wikipedia.org/wiki/2020_coronavirus_pandemic_in_Italy
+
+ addobs <- c(1,1,1,3)
+ addobsdates <- seq(as.Date("2020-2-20"),as.Date("2020-2-23"),by=1)
+   addobsdates_n <- as.numeric(addobsdates-startdate)
+
+  obs <- data.frame(c(addobsdates_n,daynumber),c(addobs,dailydead),c(addobs,dailydead)*0)
+
+} else if (case == "Wuhan") {
+
+  wuhanc <- read.csv("data/hubei.csv") #this is decent data but missing first few days
+
+  daily <- tail(wuhanc[,8],-1) - head(wuhanc[,8],-1)
+  days_n <- as.numeric(as.Date(tail(wuhanc[,1],-1))-startdate)
+
+ ####ADD IN FAKE DATA
+ ###
+ ### wuhan data are missing the first few days making 17 cases in all
+ ###
+ ### I'm just adding in a few obs to make up these values - couldn't find truth! doesn't matter though.
+ 
+
+ addobs <- c(1,0,0,0,0,1,0,1,2,2,1,2,1,2,4)
+ addobsdates <- seq(as.Date("2020-1-9"),as.Date("2020-1-23"),by=1)
+   addobsdates_n <- as.numeric(addobsdates-startdate)
+
+  obs <- data.frame(c(addobsdates_n,days_n),c(addobs,daily),c(addobs,daily)*0)
+ 
+  
+ theta_start <- c(4,2,-15,0.007,2,0.6)
+ 
+
+}else if (case == "Spain"){
+  
+  #just using worldometer data lifted from their html
+
+daily <- scan(paste("data/",case,".worldometer.txt",sep=""),skip=4,sep=",")
+dates <- seq(as.Date("2020-2-15"),by=1,length.out=length(daily))
+dates_n <- as.numeric(as.Date(dates)-as.Date(startdate))
+
+first <- min(which(daily > 0))
+
+obs <- data.frame(tail(dates_n,n=-(first-1)),tail(daily,n=-(first-1)),tail(daily,n=-(first-1))*0)
+
+}else if (case == "Italy"){
+
+  #just using worldometer data lifted from their html
+
+daily <- scan(paste("data/",case,".worldometer.txt",sep=""),skip=4,sep=",")
+dates <- seq(as.Date("2020-2-15"),by=1,length.out=length(daily))
+dates_n <- as.numeric(as.Date(dates)-as.Date(startdate))
+
+first <- min(which(daily > 0))
+
+obs <- data.frame(tail(dates_n,n=-(first-1)),tail(daily,n=-(first-1)),tail(daily,n=-(first-1))*0)
+
+
+#stop()
+}else if (case == "Switzerland"){
+  
+#just using worldometer data lifted from their html
+
+daily <- scan(paste("data/",case,".worldometer.txt",sep=""),skip=4,sep=",")
+dates <- seq(as.Date("2020-2-15"),by=1,length.out=length(daily))
+dates_n <- as.numeric(as.Date(dates)-as.Date(startdate))
+
+first <- min(which(daily > 0))
+
+obs <- data.frame(tail(dates_n,n=-(first-1)),tail(daily,n=-(first-1)),tail(daily,n=-(first-1))*0)
+
+}else if (case == "France"){
+  
+#just using worldometer data lifted from their html
+
+daily <- scan(paste("data/",case,".worldometer.txt",sep=""),skip=4,sep=",")
+dates <- seq(as.Date("2020-2-15"),by=1,length.out=length(daily))
+dates_n <- as.numeric(as.Date(dates)-as.Date(startdate))
+
+first <- min(which(daily > 0))
+
+obs <- data.frame(tail(dates_n,n=-(first-1)),tail(daily,n=-(first-1)),tail(daily,n=-(first-1))*0)
+
+
+}else if (case == "Portugal"){
+  
+  #just using worldometer data lifted from their html
+
+daily <- scan(paste("data/",case,".worldometer.txt",sep=""),skip=4,sep=",")
+dates <- seq(as.Date("2020-2-15"),by=1,length.out=length(daily))
+dates_n <- as.numeric(as.Date(dates)-as.Date(startdate))
+
+first <- min(which(daily > 0))
+
+obs <- data.frame(tail(dates_n,n=-(first-1)),tail(daily,n=-(first-1)),tail(daily,n=-(first-1))*0)
+
+
+}else if (case == "Sweden"){
+  
+#now preferring worldommeter data for now
+
+daily <- scan(paste("data/",case,".worldometer.txt",sep=""),skip=4,sep=",")
+dates <- seq(as.Date("2020-2-15"),by=1,length.out=length(daily))
+dates_n <- as.numeric(as.Date(dates)-as.Date(startdate))
+
+first <- min(which(daily > 0))
+
+obs <- data.frame(tail(dates_n,n=-(first-1)),tail(daily,n=-(first-1)),tail(daily,n=-(first-1))*0)
+
+  }else #both uk cases are the same obs
+{
+
+  
+  #just using worldometer data lifted from their html
+
+daily <- scan(paste("data/UK.worldometer.txt",sep=""),skip=4,sep=",")
+dates <- seq(as.Date("2020-2-15"),by=1,length.out=length(daily))
+dates_n <- as.numeric(as.Date(dates)-as.Date(startdate))
+
+first <- min(which(daily > 0))
+
+
+obs <- data.frame(tail(dates_n,n=-(first-1)),tail(daily,n=-(first-1)),tail(daily,n=-(first-1))*0)
+
+}
+
+print(obs)
+
+#smooth out to eliminate gaps - note slightly clumsy code to ensure conservation
+#I'm just taking 1/3 of obs from both neighbours of a zero under the assumption this is
+# a reporting error
+obsfix <- which(obs[,2]==0)
+delta_1 <- obs[obsfix-1,2]/3
+delta_2 <- obs[obsfix+1,2]/3
+obs[obsfix,2] <- obs[obsfix,2] + delta_1+delta_2
+obs[obsfix+1,2] <- obs[obsfix+1,2] - delta_2
+obs[obsfix-1,2] <- obs[obsfix-1,2] -delta_1
+
+
+####
+#### SET k HERE to withold final k obs for validation
+####
+
+k <- 0
+
+obs_extra <- NULL
+
+if(k>0){
+num_obs <- length(obs[,2])
+obs_extra <- obs[(num_obs-(k-1)):num_obs,]
+obs=obs[1:(num_obs-k),]
+}
+
+
+#Setting the observational error...this is quite important.
+
+#theory is to have a minimum of x% obs error and also a model error of y% per day
+#I have set at 20% and 3%. Actually this is done in log terms so exp(0.2) ~ 22% etc.
+
+obs[,3] <- rev(sqrt(0.2^2 + (0.03*(0:(length(obs[,3])-1)))^2))
+
+```
+
+
+```{r runmonte}
+
+#This is the  bit that actually does the work...calls the mcmc routine
+
+library(MCMCpack)
+
+
+#this should be a decent production-level length
+burn<-3000
+runlength<-5000
+#####
+
+#use these lines for shorter tests when setting up changes...saves a bit of time
+#burn<-000
+#runlength<-1000
+
+set.seed(42) #reproducibility!
+
+
+post.samp <- MCMCmetrop1R(modelcost, theta.init=theta_start,
+                          obs=obs,thin=1, mcmc=runlength, burnin=burn,
+                                  verbose=500, logfun=TRUE)
+
+
+```
+
+```{r analyse_ensemble}
+
+#just output a few diagnostics...check for reasonable convergence
+
+analyse_ensemble <- function(mcmc_object){
+library("coda")
+
+plot(mcmc_object)
+
+print(summary(mcmc_object))
+
+crosscorr(mcmc_object)
+crosscorr.plot(mcmc_object)
+
+}
+
+```
+
+
+
+```{r run_ensemble}
+
+#this does an ensemble of n_ens model runs based on posterior parameter distributionr
+
+run_ensemble <- function(post.samp,n_ens,modelrunlen){
+
+
+allouts <- array(0,dim=c(n_ens,modelrunlen+1,7))
+alldeadout <- array(0,dim = c(n_ens,modelrunlen+1))
+allcumdeadout <- array(0,dim = c(n_ens,modelrunlen+1))
+
+for (loop in 1:n_ens){
+  
+  params <- post.samp[loop*(runlength/n_ens),]
+  
+  latent_period <- max(.5,min(params[1],10)) #bound with 0.1 and 10
+  infectious_period <- max(.5,min(params[2],10)) #bound with 0.1 and 10
+  i0 <- max(0.,min(exp(params[3]),.01)) #bound with 0. and 10
+  death <- max(0.001,min(params[4],0.05)) #bound with 0.1 and 5%
+  
+  R0 <- max(1.,min(params[5],10)) #bound with 0.1 and 10 not less than 1
+  Rt <- max(0.1,min(params[6],10)) #bound with 0.1 and 10
+  
+
+  
+#set up the rundeck
+  
+    rundeck <- data.frame(dy = c(as.numeric(as.Date(interventiondate)-as.Date(startdate)),modelrunlen),R0 = c(R0,Rt))
+
+
+    #run the model
+    
+  outs <- runner(rundeck,latent_period,infectious_period,i0)
+
+
+  infectout  <- rowSums(outs[,5:6])
+
+deadout <- dead(infectout,death,infectious_period)
+
+
+    cumdeadout = cumsum(deadout)
+  
+  allouts[loop,,]<- outs
+  alldeadout[loop,] <- deadout
+  allcumdeadout[loop,] <- cumdeadout
+  
+
+}
+
+runobject <- list()
+
+runobject$allouts <- allouts
+runobject$alldeadout <- alldeadout
+runobject$allcumdeadout <- allcumdeadout
+
+return(runobject)
+}
+
+```
+
+
+```{r plot_ensemble}
+
+#plots a picture of the forecast
+
+plot_ensemble <- function(run_object,obs,mcmc_object,case,obs_extra=NULL){
+
+  
+  allouts <- run_object$allouts
+  alldeadout <- run_object$alldeadout
+  allcumdeadout <- run_object$allcumdeadout
+  
+  n_ens <- dim(allouts)[1]
+  
+  data_pts <- length(obs[,2])
+  
+  post_inter <- sum(as.Date(obs[,1],origin=startdate) > interventiondate)
+  
+  r0_mean <- mean(mcmc_object[,5])
+  r0_sd <- sd(mcmc_object[,5])
+
+  rt_mean <- mean(mcmc_object[,6])
+  rt_sd <- sd(mcmc_object[,6])
+  
+num_lines <- 0
+
+# a few choices for the plotting interval...a bit messy..
+
+
+  interval <- seq(30,150)
+  interval <- seq(30,73)
+  interval <- seq(30,121) #UK
+#  interval <- seq(50,90) #UK small test
+#  interval <- seq(10,80) #portugal
+  
+  dates <- as.Date(allouts[1,interval,1],origin=startdate)
+  lowcent <- N*(centile((alldeadout[,interval]),.05))
+  midcent <- N*(centile((alldeadout[,interval]),.5))
+  upcent <- N*(centile((alldeadout[,interval]),.95))
+
+  plot(dates,upcent,ty='n',xlab="Date",ylab="Number",main=paste("Hindcast/forecast for daily deaths in",case,"\n Initialised on", format(as.Date(tail(obs[,1],1),origin=startdate), "%a %b %d"),"with",post_inter,"data points after lockdown "),lty="dotted", lwd=2,log="y",ylim=c(.5,20000),yaxt="n")
+  points(dates,midcent,ty='l',lwd=2,col="magenta")
+ axis(side=2,labels=c("1","10","100","1000","10k"),at=c(1,10,100,1000,10000))
+
+#extra calculation for the predictive bounds including obs error and model error
+#based on my error cho
+#obs[,3] <- rev(sqrt(0.2^2 + (0.03*(0:(length(obs[,3])-1)))^2))
+
+
+nowdate <- tail(obs[,1],1)
+
+total_err <- sqrt(.2^2 + (0.03*abs(nowdate-interval))^2)
+
+up_log <- sqrt((total_err*1.64)^2 + (log(upcent/midcent))^2) #1.64 for 5-95% range
+low_log <- sqrt((total_err*1.64)^2 + (log(midcent/lowcent))^2)
+
+upper_total <- midcent*exp(up_log)
+lower_total <- midcent*exp(-low_log)
+
+polygon(c(dates,rev(dates)),c(upper_total,rev(lower_total)),col=rgb(red=0,green=1,blue=0,alpha=0.2),border="green")
+
+
+if(num_lines > 0){
+for (i in 1:num_lines){
+  
+    points(dates,N*(alldeadout[i*(n_ens/num_lines),interval]),ty='l',col='blue')
+  
+}
+}
+ points(dates,midcent,ty='l',lwd=2,col="magenta")
+
+
+points(as.Date(obs[,1],origin=startdate),pmax(obs[,2],0.0),col="red")
+
+#plotting the validation data...no analysis performed!
+if (!is.null(obs_extra)){
+points(as.Date(obs_extra[,1],origin=startdate),pmax(obs_extra[,2],0.0),col="cyan")
+}
+
+tomorrow <- which(dates == as.Date(tail(obs[,1],1)+1,origin=startdate))
+
+abline(v=interventiondate)
+
+txt0 <- sprintf("R0 = %1.1f ± %1.1f",r0_mean,r0_sd)
+text(interventiondate - 12,300,txt0)
+txtt <- sprintf("Rt = %1.1f ± %1.1f",rt_mean,rt_sd)
+text(interventiondate + 20,100,txtt)
+
+
+txtf2 <- sprintf("Tomorrow's forecast: %.0f (%.0f - %.0f)",signif(midcent[tomorrow],digits=2),signif(lower_total[tomorrow],digits=2),signif(upper_total[tomorrow],digits=2))
+
+text(interventiondate + 30,32,txtf2)
+
+#for the 7 day forecast I'm simply using the bounds of the predictive distribution which isn't quite correct but is close enough
+
+txtf3 <- sprintf("7 day forecast: %.0f (%.0f - %.0f)",signif(sum(midcent[tomorrow:(tomorrow+6)]),digits=2),signif(sum(lower_total[tomorrow:(tomorrow+6)]),digits=2),signif(sum(upper_total[tomorrow:(tomorrow+6)]),digits=2))
+
+text(interventiondate + 30,10,txtf3)
+
+
+
+####
+# cumulative deaths
+
+#for the longer forecast I'm using the centiles of the model distribution which also isn't precisely right but model/obs error is comparatively negligible in all the cases I've encountered so far
+
+
+  dates <- as.Date(allouts[1,interval,1],origin=startdate)
+  lowcent <- N*(centile((allcumdeadout[,interval]),.05))
+  midcent <- N*(centile((allcumdeadout[,interval]),.5))
+  upcent <- N*(centile((allcumdeadout[,interval]),.95))
+
+  
+  ####add total death numbers 
+
+  txt1 <- sprintf("Deaths to 30 April: %.0fk (%.0fk - %.0fk)",signif(midcent[61]/1000,digits=2),signif(lowcent[61]/1000,digits=2),signif(upcent[61]/1000,digits=2))
+text(interventiondate+30,3.2,txt1)
+
+  txt4 <- sprintf("Deaths to 31 May: %.0fk (%.0fk - %.0fk)",signif(midcent[92]/1000,digits=2),signif(lowcent[92]/1000,digits=2),signif(upcent[92]/1000,digits=2))
+  text(interventiondate+30,1,txt4)
+
+  
+ 
+  
+}
+
+```
+
+```{r make_pics}
+
+#this is the code that actually invokes the above function and makes a few plots
+
+analyse_ensemble(post.samp)
+run.obj <- run_ensemble(post.samp,500,200)
+plot_ensemble(run.obj,obs,post.samp,case,obs_extra)
+
+
+```
+
+
