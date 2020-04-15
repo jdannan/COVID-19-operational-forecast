@@ -1,4 +1,14 @@
 # COVID-19-operational-forecast
+
+15/4/2020 
+Manuscript as submitted to medrxiv with turnkey code for all analyses and figures is in paper_github.zip
+(actually it has v minor edits in text compared to the medrxiv version, code is unchanged).
+
+This is an updated and improved analysis method and the earlier files described below are deprecated.
+
+----------
+covid-19_mcmc_prediction_public.Rmd
+
 simple MCMC parameter estimation for forecasting COVID deaths (etc)
 
 Should run out of the box (once you've put the data file in the right place) to generate the forecast I
