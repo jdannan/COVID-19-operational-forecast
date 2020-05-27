@@ -1,5 +1,10 @@
 # COVID-19-operational-forecast
 
+27/5/2020
+
+operational.tar is a bundle with two Rmd files (Rmarkdown) that generate analyses and figures for the revised version of manuscript. Will add URL when manuscript available.
+
+
 15/4/2020 
 Manuscript as submitted to medrxiv with turnkey code for all analyses and figures is in paper_github.zip
 (actually it has v minor edits in text compared to the medrxiv version, code is unchanged).
